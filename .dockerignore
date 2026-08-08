@@ -9,6 +9,4 @@ venv/
 .idea/
 .vscode/
 *.md
-123.txt
-swagger.txt
-openapi.txt
+docs/

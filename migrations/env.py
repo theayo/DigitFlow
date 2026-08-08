@@ -1,4 +1,5 @@
 import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -9,7 +10,15 @@ from app.config import get_settings
 from app.models import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+
+# A caller may target another database — the test suite migrates its own schema
+# this way. Falls back to the configured working database.
+_url = (
+    config.get_main_option("sqlalchemy.url", None)
+    or os.environ.get("ALEMBIC_DATABASE_URL")
+    or get_settings().database_url
+)
+config.set_main_option("sqlalchemy.url", _url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

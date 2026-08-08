@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # Used only when rendering timestamps for the UI. Storage and sorting stay UTC.
     display_timezone: str = "Asia/Novosibirsk"
 
+    # --- tests ---
+    # Test Storage. The test database is created and migrated automatically;
+    test_database_url: str = "postgresql+asyncpg://app:app@postgres:5432/files_test"
+    test_redis_url: str = "redis://redis:6379/1"
+
 
 @lru_cache
 def get_settings() -> Settings:
