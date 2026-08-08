@@ -1,0 +1,14 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "C4", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# The engine is cached and bound to the event loop it was created on.
+# A separate loop per test would break its reuse.
+asyncio_default_test_loop_scope = "session"
+asyncio_default_fixture_loop_scope = "session"
