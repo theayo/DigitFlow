@@ -41,6 +41,17 @@ class NetworkExhausted(ExternalApiError):
     """Network errors or 5xx persisted across every allowed attempt."""
 
 
+class InvalidResponseError(ExternalApiError):
+    """A 2xx answer whose body does not match the documented contract.
+
+    Terminal rather than retried: the request went through and the service
+    answered successfully, so repeating it would only produce the same body. The
+    danger is specific — a missing `file_names` read as an empty list would be
+    indistinguishable from "the catalog is finished" and would end the run as
+    `done` with the catalog half downloaded.
+    """
+
+
 class ArchiveError(WorkerError):
     """The ZIP payload failed validation and must not be saved."""
 
@@ -56,3 +67,18 @@ class LockLost(WorkerError):
 
 class RunFailed(WorkerError):
     """Terminal condition: the run stops and is recorded as failed."""
+
+
+class FileUnavailable(RunFailed):
+    """One specific file cannot be obtained, however many times we ask.
+
+    Terminal for the run — an unconfirmable file comes back from /names forever
+    (§ 2) — but not immediately. The other names of the same chunk have nothing
+    to do with this one and are still downloaded, saved and confirmed before the
+    run is closed (§ 8.4). That is what keeps the outcome independent of the
+    order the names happened to arrive in.
+    """
+
+    def __init__(self, name: str, message: str) -> None:
+        super().__init__(message)
+        self.name = name

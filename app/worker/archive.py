@@ -9,6 +9,7 @@ import hashlib
 import io
 import re
 import zipfile
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -42,6 +43,37 @@ def content_hash(content: str) -> str:
 def _reject_path(name: str) -> None:
     if "/" in name or "\\" in name or name in {".", ".."} or ".." in name.split("/"):
         raise ArchiveError(f"недопустимое имя записи в архиве: {name!r}")
+
+
+def _read_entry(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    """Extract one entry, turning every expected failure into an `ArchiveError`.
+
+    Opening the archive is not the only thing that can fail: a wrong CRC, an
+    encrypted entry and an unsupported compression method all surface here, and
+    each arrives as a different exception type. Left alone they escape as
+    unexpected errors and skip the per-name isolation that is supposed to find
+    out which file is at fault (§ 8.4).
+
+    The list is deliberately exhaustive rather than a bare `except Exception`:
+    anything not named here is a bug on our side, not a bad archive.
+    """
+    try:
+        return archive.read(info)
+    except zipfile.BadZipFile as exc:
+        # Includes a CRC mismatch, reported as "Bad CRC-32".
+        raise ArchiveError(f"запись {info.filename!r} не читается: {exc}") from exc
+    except NotImplementedError as exc:
+        # Before RuntimeError, which it subclasses — otherwise an unsupported
+        # compression method would be reported as an unreadable entry.
+        raise ArchiveError(
+            f"запись {info.filename!r} сжата неподдерживаемым методом: {exc}"
+        ) from exc
+    except RuntimeError as exc:
+        # What zipfile raises for an encrypted entry without a password.
+        raise ArchiveError(f"запись {info.filename!r} не читается: {exc}") from exc
+    except (EOFError, zlib.error) as exc:
+        # Truncated entry, or a corrupt deflate stream.
+        raise ArchiveError(f"запись {info.filename!r} повреждена: {exc}") from exc
 
 
 def parse_archive(
@@ -87,7 +119,7 @@ def parse_archive(
                     f"{info.file_size} байт при пределе {max_entry_bytes}"
                 )
 
-            raw = archive.read(info)
+            raw = _read_entry(archive, info)
             try:
                 text = raw.decode("ascii")
             except UnicodeDecodeError as exc:
