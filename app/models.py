@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -23,8 +24,14 @@ from app.time import utc_now
 # File content length, fixed by the task statement.
 CONTENT_LENGTH = 500
 
-RUN_STATUSES = ("pending", "running", "waiting_retry", "done", "failed")
+RUN_STATUSES = ("pending", "starting", "running", "waiting_retry", "done", "failed")
 EVENT_LEVELS = ("info", "warning", "error")
+
+# Statuses that occupy the single download slot. Mirrors ACTIVE_STATUSES in
+# app/services/runs.py; kept here as SQL because the database enforces the same
+# rule through a partial unique index.
+ACTIVE_STATUS_LIST = "'pending', 'starting', 'running', 'waiting_retry'"
+ACTIVE_RUN_INDEX = "uq_download_run_active"
 
 
 class Base(DeclarativeBase):
@@ -36,9 +43,22 @@ class DownloadRun(Base):
 
     __tablename__ = "download_run"
     __table_args__ = (
+        # `starting` sits between "claimed by a worker" and "provably holding the
+        # download lock" (§ 8.8). Keep the list in sync with RUN_STATUSES and with
+        # the migration that last changed this constraint.
         CheckConstraint(
-            "status IN ('pending', 'running', 'waiting_retry', 'done', 'failed')",
+            "status IN ('pending', 'starting', 'running', 'waiting_retry', 'done', 'failed')",
             name="ck_download_run_status",
+        ),
+        # At most one active run in the whole service, enforced by PostgreSQL
+        # rather than by a check-then-insert (§ 7.1). The index is over a constant
+        # expression, so two rows matching the WHERE clause collide with each
+        # other whatever their statuses are. Created by migration 0003.
+        Index(
+            ACTIVE_RUN_INDEX,
+            text("(status IS NOT NULL)"),
+            unique=True,
+            postgresql_where=text(f"status IN ({ACTIVE_STATUS_LIST})"),
         ),
     )
 
