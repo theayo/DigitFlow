@@ -1,4 +1,4 @@
-"""Pacing of outgoing requests to the external API.
+"""Pacing of outgoing requests to the external API: the Redis side of `RateLimiter`.
 
 The service publishes neither its rate limit nor its window, so the pace is ours
 to choose: at least `external_min_interval_ms` between any two consecutive
@@ -34,7 +34,7 @@ return start - now
 """
 
 
-class RateLimiter:
+class RedisRateLimiter:
     """Reserves send slots so that requests never come closer than the interval."""
 
     def __init__(

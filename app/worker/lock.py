@@ -1,13 +1,20 @@
-"""Distributed "one active run" lock.
+"""Distributed "one active run" lock: the Redis side of `RunLock` and `RunSlot`.
 
-Kept in Redis rather than checked in the database: a database check is a race
-between two simultaneous starts. The token is derived from the run id, so a
-Celery retry of the same task recognises its own lock and carries on instead of
-deadlocking against itself.
+PostgreSQL guarantees that at most one active run exists; this Redis lock has a
+different job: it proves which worker owns the download slot while external
+requests are in progress. The token is derived from the run id, so a Celery
+retry of the same task recognises its own lock instead of deadlocking against a
+lock it left behind itself. That token is *not* what keeps two deliveries of the
+same run apart — being identical, it cannot. The database claim does that
+(§ 8.8).
 
 Losing the lock is treated as fatal. If another worker holds the slot it may be
 downloading the same names, and a confirmation sent from here could mark a file
 that this process never stored.
+
+Lua, TTL, heartbeat and owner-only release are details of this module. What the
+application depends on is narrower: `RunLock.ensure_owned()` for the run that
+holds the slot, `RunSlot.owner()` for orphan reaping.
 """
 
 import asyncio
@@ -18,6 +25,7 @@ from contextlib import asynccontextmanager
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from app.services.runs import SlotUnavailable
 from app.worker.errors import LockLost
 
 LOCK_KEY = "dl:lock:run"
@@ -54,12 +62,47 @@ return 0
 """
 
 
+TOKEN_PREFIX = "run:"
+
+
 def token_for(run_id: int) -> str:
-    return f"run:{run_id}"
+    return f"{TOKEN_PREFIX}{run_id}"
 
 
-class RunLock:
-    """Ownership of the single download slot."""
+def run_id_from_token(token: str | bytes | None) -> int | None:
+    """Recover the run id from a lock token, or None if the value is not one.
+
+    Kept next to `token_for`: the format is an implementation detail of this
+    module, and orphan reaping (§ 8.6) has to read it back.
+    """
+    if token is None:
+        return None
+    raw = token.decode() if isinstance(token, bytes) else str(token)
+    if not raw.startswith(TOKEN_PREFIX):
+        return None
+    suffix = raw.removeprefix(TOKEN_PREFIX)
+    return int(suffix) if suffix.isdigit() else None
+
+
+class RedisRunSlot:
+    """Reads the owner of the download slot. Implements `RunSlot`.
+
+    Exists so that orphan reaping can ask "who owns the slot" without knowing
+    that the answer is a token in a Redis key.
+    """
+
+    def __init__(self, redis: Redis) -> None:
+        self._redis = redis
+
+    async def owner(self) -> int | None:
+        try:
+            return run_id_from_token(await self._redis.get(LOCK_KEY))
+        except RedisError as exc:
+            raise SlotUnavailable(f"Redis недоступен при чтении lock: {exc}") from exc
+
+
+class RedisRunLock:
+    """Ownership of the single download slot. Implements `RunLock`."""
 
     def __init__(self, redis: Redis, run_id: int, ttl_s: float, heartbeat_s: float) -> None:
         self._redis = redis

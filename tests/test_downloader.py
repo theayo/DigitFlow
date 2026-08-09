@@ -19,13 +19,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
 from app.models import DownloadRun, File, RunEvent
+from app.progress import RedisProgressStore
+from app.services.runs import claim_run, start_running
 from app.time import utc_now
 from app.worker.archive import CONTENT_LENGTH, content_hash, digit_counts
 from app.worker.client import DOWNLOAD_PATH, DOWNLOADED_PATH, NAMES_PATH, FilesApiClient
 from app.worker.downloader import DownloadRunner
 from app.worker.errors import NetworkExhausted
-from app.worker.lock import LOCK_KEY, RunLock, token_for
-from app.worker.progress import read as read_progress
+from app.worker.lock import LOCK_KEY, RedisRunLock, token_for
 
 BASE_URL = "http://external.test"
 
@@ -58,7 +59,7 @@ def tuned_settings():
 
 
 class InstantLimiter:
-    """No pacing: the pacing logic has its own tests."""
+    """No pacing: the pacing logic has its own tests. Implements `RateLimiter`."""
 
     async def reserve(self) -> float:
         return 0.0
@@ -66,13 +67,23 @@ class InstantLimiter:
     async def penalize(self) -> int:
         return 0
 
+    async def reset(self) -> None:
+        return None
+
 
 async def make_run(sessionmaker: async_sessionmaker[AsyncSession]) -> int:
+    """A run in the state the task adapter hands to the runner: claimed and running."""
     async with sessionmaker() as session:
         run = DownloadRun(candidate_id=f"test-{uuid.uuid4()}", status="pending")
         session.add(run)
         await session.commit()
-        return run.id
+        run_id = run.id
+        # The runner never sets the status itself and refuses to work on anything
+        # but `running`, so the whole startup path is replayed here: pending ->
+        # starting on claim, starting -> running once the slot is held (§ 8.8).
+        assert await claim_run(session, run_id)
+        assert await start_running(session, run_id)
+        return run_id
 
 
 async def run_loop(
@@ -80,12 +91,12 @@ async def run_loop(
     redis: aioredis.Redis,
     sessionmaker: async_sessionmaker[AsyncSession],
     *,
-    lock: RunLock | None = None,
+    lock: RedisRunLock | None = None,
     runner_cls: type[DownloadRunner] = DownloadRunner,
 ) -> str:
     settings = tuned_settings()
     if lock is None:
-        lock = RunLock(redis, run_id, ttl_s=30, heartbeat_s=10)
+        lock = RedisRunLock(redis, run_id, ttl_s=30, heartbeat_s=10)
     await lock.acquire()
     async with httpx.AsyncClient(base_url=BASE_URL) as http:
         runner = runner_cls(
@@ -94,7 +105,7 @@ async def run_loop(
             client=FilesApiClient(settings, InstantLimiter(), http),
             lock=lock,
             sessionmaker=sessionmaker,
-            redis=redis,
+            progress=RedisProgressStore(redis),
         )
         return await runner.execute()
 
@@ -159,10 +170,10 @@ async def test_full_catalog_is_downloaded(redis, sessionmaker) -> None:
     # 4 names against a limit of 3 per request means two download calls.
     assert marked.call_count == 2
 
-    progress = await read_progress(redis)
+    progress = await RedisProgressStore(redis).read()
     assert progress is not None
-    assert progress["status"] == "done"
-    assert progress["files_saved"] == "4"
+    assert progress.status == "done"
+    assert progress.files_saved == 4
 
 
 def _requested(request: httpx.Request) -> list[str]:
@@ -272,6 +283,125 @@ async def test_404_is_isolated_and_fails_the_run(redis, sessionmaker) -> None:
     assert any("разбиваю на одиночные запросы" in message for message in log)
 
 
+@pytest.mark.parametrize("bad_position", [0, 1, 2], ids=["первым", "в середине", "последним"])
+async def test_isolation_does_not_depend_on_the_order_of_names(
+    redis, sessionmaker, bad_position: int
+) -> None:
+    """A file that cannot be obtained must not take its chunk-mates down with it.
+
+    Stopping at the first bad name made the outcome depend on where it happened
+    to sit: the same chunk saved two files or none. The names arrive in a random
+    order from /names, so that is a coin toss over how much of the catalog gets
+    downloaded before the run stops.
+    """
+    run_id = await make_run(sessionmaker)
+    good = [f"good-{index}-{uuid.uuid4()}.txt" for index in range(2)]
+    bad = f"bad-{uuid.uuid4()}.txt"
+    names = [*good]
+    names.insert(bad_position, bad)
+
+    def download(request: httpx.Request) -> httpx.Response:
+        requested = _requested(request)
+        if bad in requested:
+            return httpx.Response(404, json={"detail": "нет файла"})
+        return httpx.Response(200, content=zip_for(requested))
+
+    async with respx.mock(base_url=BASE_URL) as mock:
+        mock.get(NAMES_PATH).respond(200, json={"file_names": names})
+        mock.post(DOWNLOAD_PATH).mock(side_effect=download)
+        confirmed: list[str] = []
+
+        def mark(request: httpx.Request) -> httpx.Response:
+            requested = _requested(request)
+            confirmed.extend(requested)
+            return httpx.Response(200, json={"marked_now": len(requested), "already_marked": 0})
+
+        mock.post(DOWNLOADED_PATH).mock(side_effect=mark)
+
+        status = await run_loop(run_id, redis, sessionmaker)
+
+    assert status == "failed"
+    # Every healthy name of the chunk is saved and confirmed, wherever the bad
+    # one sat.
+    assert await saved_names(sessionmaker, run_id) == set(good)
+    assert sorted(confirmed) == sorted(good)
+    assert bad not in confirmed
+
+    run = await fetch_run(sessionmaker, run_id)
+    assert run.error is not None and bad in run.error
+
+
+async def test_several_bad_names_are_all_reported(redis, sessionmaker) -> None:
+    run_id = await make_run(sessionmaker)
+    good = f"good-{uuid.uuid4()}.txt"
+    first_bad = f"bad-a-{uuid.uuid4()}.txt"
+    second_bad = f"bad-b-{uuid.uuid4()}.txt"
+    names = [first_bad, good, second_bad]
+
+    def download(request: httpx.Request) -> httpx.Response:
+        requested = _requested(request)
+        if first_bad in requested or second_bad in requested:
+            return httpx.Response(404, json={"detail": "нет файла"})
+        return httpx.Response(200, content=zip_for(requested))
+
+    async with respx.mock(base_url=BASE_URL) as mock:
+        mock.get(NAMES_PATH).respond(200, json={"file_names": names})
+        mock.post(DOWNLOAD_PATH).mock(side_effect=download)
+        mock.post(DOWNLOADED_PATH).mock(
+            side_effect=lambda request: httpx.Response(
+                200, json={"marked_now": len(_requested(request)), "already_marked": 0}
+            )
+        )
+
+        status = await run_loop(run_id, redis, sessionmaker)
+
+    assert status == "failed"
+    assert await saved_names(sessionmaker, run_id) == {good}
+
+    run = await fetch_run(sessionmaker, run_id)
+    assert first_bad in run.error and second_bad in run.error
+
+
+async def test_a_lost_lock_stops_the_chunk_immediately(redis, sessionmaker) -> None:
+    """Only a per-file failure lets the loop go on; a run-wide one must not.
+
+    The chunk is split name by name, and the lock is stolen while the first of
+    them is being handled. The remaining names must not be requested at all.
+    """
+    run_id = await make_run(sessionmaker)
+    names = [f"{index}-{uuid.uuid4()}.txt" for index in range(3)]
+    lock = RedisRunLock(redis, run_id, ttl_s=30, heartbeat_s=10)
+    await lock.acquire()
+
+    requested_names: list[str] = []
+
+    def download(request: httpx.Request) -> httpx.Response:
+        requested = _requested(request)
+        requested_names.extend(requested)
+        if len(requested) > 1:
+            # Reject the whole chunk to force the split.
+            return httpx.Response(404, json={"detail": "нет файла"})
+        # The slot goes to somebody else while the first single name is in flight.
+        asyncio.get_running_loop().create_task(redis.set(LOCK_KEY, token_for(777777)))
+        return httpx.Response(200, content=zip_for(requested))
+
+    async with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get(NAMES_PATH).respond(200, json={"file_names": names})
+        mock.post(DOWNLOAD_PATH).mock(side_effect=download)
+        confirm = mock.post(DOWNLOADED_PATH).respond(
+            200, json={"marked_now": 1, "already_marked": 0}
+        )
+
+        status = await run_loop(run_id, redis, sessionmaker, lock=lock)
+
+    assert status == "failed"
+    assert confirm.call_count == 0
+    # The chunk itself plus the first isolated name — and then nothing.
+    assert len(requested_names) == len(names) + 1
+    run = await fetch_run(sessionmaker, run_id)
+    assert "перешёл другому владельцу" in run.error
+
+
 # --- conflicts --------------------------------------------------------------
 
 
@@ -372,11 +502,11 @@ async def test_run_without_progress_is_stopped(redis, sessionmaker) -> None:
 
 
 async def test_second_run_does_not_start_while_one_holds_the_lock(redis, sessionmaker) -> None:
-    first = RunLock(redis, run_id=1234, ttl_s=30, heartbeat_s=10)
+    first = RedisRunLock(redis, run_id=1234, ttl_s=30, heartbeat_s=10)
     assert await first.acquire() is True
 
     try:
-        second = RunLock(redis, run_id=5678, ttl_s=30, heartbeat_s=10)
+        second = RedisRunLock(redis, run_id=5678, ttl_s=30, heartbeat_s=10)
         async with second.hold() as acquired:
             assert acquired is False
     finally:
@@ -450,7 +580,7 @@ async def test_wrong_digit_distribution_fails_the_run(redis, sessionmaker) -> No
 async def test_heartbeat_losing_redis_stops_the_run(redis, sessionmaker, monkeypatch) -> None:
     """A Redis failure in the background heartbeat must terminate the run."""
     run_id = await make_run(sessionmaker)
-    lock = RunLock(redis, run_id, ttl_s=30, heartbeat_s=0.05)
+    lock = RedisRunLock(redis, run_id, ttl_s=30, heartbeat_s=0.05)
 
     async def broken_extend() -> bool:
         raise RedisError("соединение потеряно")
@@ -484,7 +614,7 @@ async def test_heartbeat_losing_redis_stops_the_run(redis, sessionmaker, monkeyp
 async def test_lock_stolen_during_retry_after_stops_the_retry(redis, sessionmaker) -> None:
     """After the pause the request must not be repeated by a run that lost the slot."""
     run_id = await make_run(sessionmaker)
-    lock = RunLock(redis, run_id, ttl_s=30, heartbeat_s=10)
+    lock = RedisRunLock(redis, run_id, ttl_s=30, heartbeat_s=10)
     await lock.acquire()
 
     def steal_then_throttle(request: httpx.Request) -> httpx.Response:
@@ -509,7 +639,7 @@ async def test_lock_lost_after_commit_prevents_confirmation(redis, sessionmaker)
     """Files may stay in our database, but nothing is confirmed to the external API."""
     run_id = await make_run(sessionmaker)
     name = f"{uuid.uuid4()}.txt"
-    lock = RunLock(redis, run_id, ttl_s=30, heartbeat_s=10)
+    lock = RedisRunLock(redis, run_id, ttl_s=30, heartbeat_s=10)
     await lock.acquire()
 
     class StealAfterCommit(DownloadRunner):

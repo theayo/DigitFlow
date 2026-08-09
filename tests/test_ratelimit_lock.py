@@ -7,8 +7,8 @@ import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
 from app.worker.errors import LockLost
-from app.worker.lock import LOCK_KEY, RunLock, token_for
-from app.worker.ratelimit import INTERVAL_KEY, RateLimiter
+from app.worker.lock import LOCK_KEY, RedisRunLock, token_for
+from app.worker.ratelimit import INTERVAL_KEY, RedisRateLimiter
 
 MAX_RETRY_WAIT_S = 1900
 
@@ -18,8 +18,8 @@ def build_limiter(
     minimum: int = 200,
     maximum: int = 800,
     max_retry_wait_s: int = MAX_RETRY_WAIT_S,
-) -> RateLimiter:
-    return RateLimiter(
+) -> RedisRateLimiter:
+    return RedisRateLimiter(
         redis,
         min_interval_ms=minimum,
         max_interval_ms=maximum,
@@ -95,8 +95,8 @@ async def test_penalty_survives_a_pause_longer_than_the_old_ttl(
 
 
 async def test_lock_is_exclusive_between_runs(redis: aioredis.Redis) -> None:
-    first = RunLock(redis, run_id=1, ttl_s=30, heartbeat_s=10)
-    second = RunLock(redis, run_id=2, ttl_s=30, heartbeat_s=10)
+    first = RedisRunLock(redis, run_id=1, ttl_s=30, heartbeat_s=10)
+    second = RedisRunLock(redis, run_id=2, ttl_s=30, heartbeat_s=10)
 
     assert await first.acquire() is True
     assert await second.acquire() is False
@@ -108,10 +108,10 @@ async def test_lock_is_exclusive_between_runs(redis: aioredis.Redis) -> None:
 
 async def test_same_run_readopts_its_own_lock(redis: aioredis.Redis) -> None:
     """A Celery retry of the same run must continue, not deadlock against itself."""
-    lock = RunLock(redis, run_id=7, ttl_s=30, heartbeat_s=10)
+    lock = RedisRunLock(redis, run_id=7, ttl_s=30, heartbeat_s=10)
     await lock.acquire()
 
-    retry = RunLock(redis, run_id=7, ttl_s=30, heartbeat_s=10)
+    retry = RedisRunLock(redis, run_id=7, ttl_s=30, heartbeat_s=10)
 
     assert await retry.acquire() is True
     await retry.release()
@@ -119,7 +119,7 @@ async def test_same_run_readopts_its_own_lock(redis: aioredis.Redis) -> None:
 
 async def test_owner_change_between_attempts_blocks_acquire(redis: aioredis.Redis) -> None:
     """The lock expired and someone else took it: re-adoption must not succeed."""
-    lock = RunLock(redis, run_id=7, ttl_s=30, heartbeat_s=10)
+    lock = RedisRunLock(redis, run_id=7, ttl_s=30, heartbeat_s=10)
     assert await lock.acquire() is True
 
     # Exactly what an expiry followed by a takeover looks like from Redis.
@@ -131,7 +131,7 @@ async def test_owner_change_between_attempts_blocks_acquire(redis: aioredis.Redi
 
 async def test_release_does_not_touch_someone_elses_lock(redis: aioredis.Redis) -> None:
     await redis.set(LOCK_KEY, token_for(99))
-    stranger = RunLock(redis, run_id=100, ttl_s=30, heartbeat_s=10)
+    stranger = RedisRunLock(redis, run_id=100, ttl_s=30, heartbeat_s=10)
 
     assert await stranger.release() is False
     assert await stranger.holder() == token_for(99)
@@ -139,7 +139,7 @@ async def test_release_does_not_touch_someone_elses_lock(redis: aioredis.Redis) 
 
 async def test_release_after_takeover_keeps_the_new_owner(redis: aioredis.Redis) -> None:
     """Our own release must not evict the run that legitimately took over."""
-    lock = RunLock(redis, run_id=42, ttl_s=30, heartbeat_s=10)
+    lock = RedisRunLock(redis, run_id=42, ttl_s=30, heartbeat_s=10)
     await lock.acquire()
 
     await redis.set(LOCK_KEY, token_for(43))
@@ -149,7 +149,7 @@ async def test_release_after_takeover_keeps_the_new_owner(redis: aioredis.Redis)
 
 
 async def test_lock_is_released_when_the_body_raises(redis: aioredis.Redis) -> None:
-    lock = RunLock(redis, run_id=5, ttl_s=30, heartbeat_s=10)
+    lock = RedisRunLock(redis, run_id=5, ttl_s=30, heartbeat_s=10)
 
     try:
         async with lock.hold() as acquired:
@@ -163,7 +163,7 @@ async def test_lock_is_released_when_the_body_raises(redis: aioredis.Redis) -> N
 
 async def test_heartbeat_extends_the_ttl(redis: aioredis.Redis) -> None:
     """The TTL is shorter than a Retry-After pause, so renewal must keep working."""
-    lock = RunLock(redis, run_id=11, ttl_s=1, heartbeat_s=0.3)
+    lock = RedisRunLock(redis, run_id=11, ttl_s=1, heartbeat_s=0.3)
 
     async with lock.hold() as acquired:
         assert acquired
@@ -174,7 +174,7 @@ async def test_heartbeat_extends_the_ttl(redis: aioredis.Redis) -> None:
 
 
 async def test_ownership_check_detects_a_stolen_lock(redis: aioredis.Redis) -> None:
-    lock = RunLock(redis, run_id=21, ttl_s=30, heartbeat_s=10)
+    lock = RedisRunLock(redis, run_id=21, ttl_s=30, heartbeat_s=10)
     await lock.acquire()
     await lock.ensure_owned()
 
@@ -188,7 +188,7 @@ async def test_heartbeat_redis_failure_marks_the_lock_lost(
     redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A Redis error inside the background task must not vanish silently."""
-    lock = RunLock(redis, run_id=31, ttl_s=30, heartbeat_s=0.05)
+    lock = RedisRunLock(redis, run_id=31, ttl_s=30, heartbeat_s=0.05)
 
     async def broken_extend() -> bool:
         raise RedisError("соединение потеряно")

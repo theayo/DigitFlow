@@ -14,22 +14,32 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models import DownloadRun, RunEvent
+from app.time import utc_now
 from app.worker import tasks
 from app.worker.downloader import DownloadRunner
+from app.worker.lock import token_for
 
 
 class FakeRedis:
-    """Redis stub that fails exactly where a test needs it to."""
+    """Redis stub that fails exactly where a test needs it to.
+
+    `holder` is what the lock key contains. It has to agree with `eval_result`:
+    a stub that reports the lock as taken and then names a stranger as its owner
+    describes a state that cannot happen, and every ownership check would trip
+    over it before reaching the failure the test is actually about.
+    """
 
     def __init__(
         self,
         *,
         eval_result: int = 1,
+        holder: bytes = b"run:999",
         fail_eval: bool = False,
         fail_get: bool = False,
         fail_delete: bool = False,
     ) -> None:
         self._eval_result = eval_result
+        self._holder = holder
         self._fail_eval = fail_eval
         self._fail_get = fail_get
         self._fail_delete = fail_delete
@@ -43,7 +53,7 @@ class FakeRedis:
     async def get(self, *args: object) -> bytes:
         if self._fail_get:
             raise RedisError("соединение с Redis потеряно")
-        return b"run:999"
+        return self._holder
 
     async def delete(self, *args: object) -> int:
         if self._fail_delete:
@@ -148,8 +158,10 @@ async def test_redis_failure_during_limiter_reset_closes_the_run(
     sessionmaker, broken_redis
 ) -> None:
     """The lock was taken, but pacing state could not be cleared."""
-    broken_redis(FakeRedis(eval_result=1, fail_delete=True))
     run_id = await make_run(sessionmaker)
+    # The stub has to say the lock is ours, because it is: the run got past
+    # acquire, and everything afterwards verifies ownership.
+    broken_redis(FakeRedis(eval_result=1, holder=token_for(run_id).encode(), fail_delete=True))
 
     status = await tasks.execute_run(run_id)
 
@@ -188,20 +200,25 @@ async def test_failure_after_start_keeps_the_runner_diagnostics(
     assert len(await error_events(sessionmaker, run_id)) == 1
 
 
-async def test_finish_early_leaves_a_running_run_alone(sessionmaker) -> None:
-    """Second line of defence: only a pending run may be closed from here."""
+async def test_finish_early_leaves_a_terminal_run_alone(sessionmaker) -> None:
+    """Second line of defence: a settled outcome is never overwritten from here.
+
+    A `running` run, by contrast, may well be ours — the delivery guard claims it
+    before the lock is taken — so that state is closable and deliberately not
+    protected.
+    """
     run_id = await make_run(sessionmaker)
     async with sessionmaker() as session:
         run = await session.get(DownloadRun, run_id)
-        run.status = "running"
+        run.status = "done"
+        run.finished_at = utc_now()
         await session.commit()
 
     await tasks._finish_early(run_id, "Redis недоступен на подготовке рана: выдумка")
 
     run = await fetch_run(sessionmaker, run_id)
-    assert run.status == "running"
+    assert run.status == "done"
     assert run.error is None
-    assert run.finished_at is None
     assert await error_events(sessionmaker, run_id) == []
 
 

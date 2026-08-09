@@ -8,33 +8,39 @@ every unrecoverable problem ends the run instead of skipping the file.
 """
 
 import asyncio
-import contextlib
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import timedelta
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
-from redis.exceptions import RedisError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
 from app.models import CONTENT_LENGTH, DownloadRun, File, RunEvent
-from app.time import utc_now
+from app.progress import Progress, ProgressStore
+from app.services.runs import finish_run, set_run_status
+from app.time import ensure_aware, utc_now
 from app.worker.archive import ParsedFile, content_hash, digit_counts, parse_archive
 from app.worker.client import MAX_NAMES_PER_DOWNLOAD, FilesApiClient
 from app.worker.errors import (
     ArchiveError,
+    FileUnavailable,
+    InvalidResponseError,
     LockLost,
     NotFoundError,
     RetryAfterError,
     RunFailed,
     UnprocessableError,
 )
-from app.worker.lock import RunLock
-from app.worker.progress import Progress, publish
 
 T = TypeVar("T")
+
+
+class RunLock(Protocol):
+    """Ownership check required before irreversible worker actions."""
+
+    async def ensure_owned(self) -> None: ...
 
 
 def chunked(items: Sequence[str], size: int) -> Iterator[list[str]]:
@@ -53,14 +59,14 @@ class DownloadRunner:
         client: FilesApiClient,
         lock: RunLock,
         sessionmaker: async_sessionmaker[AsyncSession],
-        redis,
+        progress: ProgressStore,
     ) -> None:
         self._run_id = run_id
         self._settings = settings
         self._client = client
         self._lock = lock
         self._sessionmaker = sessionmaker
-        self._redis = redis
+        self._progress = progress
 
         self._names_seen = 0
         self._files_saved = 0
@@ -155,15 +161,39 @@ class DownloadRunner:
         return marked_now
 
     async def _isolate(self, chunk: list[str], exc: Exception, attempt: int) -> int:
-        """Find the offending name by requesting the chunk one name at a time."""
+        """Find the offending name by requesting the chunk one name at a time.
+
+        Every name of the chunk is attempted, whatever happens to the others: a
+        file that cannot be obtained says nothing about the rest, and stopping at
+        the first one would make the outcome depend on the order the names came
+        in — the same chunk would save two files or none depending on where the
+        bad name sat. The run is still closed as `failed` afterwards, listing
+        every name that could not be obtained.
+        """
         if len(chunk) > 1:
             await self._event(
                 "warning",
                 f"чанк из {len(chunk)} имён отклонён ({exc}); разбиваю на одиночные запросы",
             )
             confirmed = 0
+            unavailable: list[str] = []
             for name in chunk:
-                confirmed += await self._process_chunk([name], attempt=1)
+                try:
+                    confirmed += await self._process_chunk([name], attempt=1)
+                except FileUnavailable as file_exc:
+                    # Only this one exception is per-file. Anything else — a lost
+                    # lock, an exhausted network, a pause beyond the limit — is a
+                    # condition of the whole run and must stop it right here.
+                    unavailable.append(file_exc.name)
+                    await self._event("error", str(file_exc))
+
+            if unavailable:
+                raise RunFailed(
+                    f"не удалось получить файлы: {', '.join(unavailable)}. "
+                    "Остальные имена чанка обработаны, но продолжать нельзя: "
+                    "эти файлы невозможно ни скачать, ни отметить, "
+                    "и они будут возвращаться из /names бесконечно"
+                )
             return confirmed
 
         name = chunk[0]
@@ -176,10 +206,11 @@ class DownloadRunner:
             await asyncio.sleep(self._settings.network_backoff_base_s)
             return await self._process_chunk([name], attempt=attempt + 1)
 
-        raise RunFailed(
+        raise FileUnavailable(
+            name,
             f"файл {name} не удалось получить за {attempt} попыток: {exc}. "
-            "Продолжать нельзя: этот файл невозможно ни скачать, ни отметить, "
-            "и он будет возвращаться из /names бесконечно"
+            "Этот файл невозможно ни скачать, ни отметить, "
+            "и он будет возвращаться из /names бесконечно",
         )
 
     # --- persistence --------------------------------------------------------
@@ -288,6 +319,13 @@ class DownloadRunner:
                 await self._leave_waiting()
             except UnprocessableError as exc:
                 raise RunFailed(f"наш запрос отвергнут как некорректный: {exc}") from exc
+            except InvalidResponseError as exc:
+                # The service answered successfully with a body we cannot trust.
+                # Retrying would return the same body, and guessing what it meant
+                # is exactly how a half-downloaded catalog gets reported as done.
+                raise RunFailed(
+                    f"внешнее API вернуло некорректный ответ ({description}): {exc}"
+                ) from exc
 
     async def _enter_waiting(self, reason: str, delay: float) -> None:
         self._status = "waiting_retry"
@@ -303,40 +341,50 @@ class DownloadRunner:
     # --- run bookkeeping ----------------------------------------------------
 
     async def _begin(self) -> None:
+        # No status is set here. The task adapter has already claimed the run and
+        # moved it to `running` — conditionally, and only after verifying that it
+        # owns the lock (§ 8.8). This reads that state back and refuses to work on
+        # anything else: a run closed in the meantime must not have downloads
+        # performed under it. The start time comes from the same row, so the page
+        # and the progress agree on when work began.
         async with self._sessionmaker() as session:
             run = await session.get(DownloadRun, self._run_id)
             if run is None:
                 raise RunFailed(f"ран {self._run_id} не найден в базе")
-            run.status = "running"
-            run.started_at = self._started_at
-            await session.commit()
+            if run.status != "running":
+                raise RunFailed(
+                    f"ран {self._run_id} не в статусе running (сейчас {run.status}): "
+                    "работать под чужим или уже закрытым раном нельзя"
+                )
+            self._started_at = ensure_aware(run.started_at)
 
         await self._event("info", "процесс скачивания запущен")
         await self._publish()
 
     async def _finish(self, status: str, error: str | None) -> None:
         self._status = status
-        async with self._sessionmaker() as session:
-            run = await session.get(DownloadRun, self._run_id)
-            if run is not None:
-                run.status = status
-                run.finished_at = utc_now()
-                run.names_seen = self._names_seen
-                run.files_saved = self._files_saved
-                run.error = error
-                await session.commit()
-
         level = "error" if status == "failed" else "info"
         message = error if error else f"процесс завершён: скачано {self._files_saved} файлов"
-        await self._event(level, message)
+
+        async with self._sessionmaker() as session:
+            # Conditional: a run already closed by the reaper keeps its outcome
+            # and its counters rather than being overwritten from here.
+            await finish_run(
+                session,
+                self._run_id,
+                status=status,
+                error=error,
+                names_seen=self._names_seen,
+                files_saved=self._files_saved,
+                event=message,
+                event_level=level,
+            )
+
         await self._publish()
 
     async def _set_status(self, status: str) -> None:
         async with self._sessionmaker() as session:
-            run = await session.get(DownloadRun, self._run_id)
-            if run is not None:
-                run.status = status
-                await session.commit()
+            await set_run_status(session, self._run_id, status)
 
     async def _event(self, level: str, message: str) -> None:
         async with self._sessionmaker() as session:
@@ -344,19 +392,18 @@ class DownloadRunner:
             await session.commit()
 
     async def _publish(self, retry_at=None, retry_reason=None) -> None:
-        # Progress is a convenience for the UI. If Redis is gone the run is already
-        # doomed by the ownership check, and that failure has to reach the database
-        # rather than being replaced by this one.
-        with contextlib.suppress(RedisError):
-            await publish(
-                self._redis,
-                Progress(
-                    run_id=self._run_id,
-                    status=self._status,
-                    started_at=self._started_at,
-                    names_seen=self._names_seen,
-                    files_saved=self._files_saved,
-                    retry_at=retry_at,
-                    retry_reason=retry_reason,
-                ),
+        # Best effort by contract: progress is a convenience for the UI, and a
+        # store that is unreachable must not become this run's cause of death —
+        # the ownership check is what decides that, and its diagnosis has to
+        # reach the database intact.
+        await self._progress.publish(
+            Progress(
+                run_id=self._run_id,
+                status=self._status,
+                started_at=self._started_at,
+                names_seen=self._names_seen,
+                files_saved=self._files_saved,
+                retry_at=retry_at,
+                retry_reason=retry_reason,
             )
+        )
