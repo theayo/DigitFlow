@@ -42,9 +42,13 @@ body {
   text-decoration: none;
 }
 
-.tab:hover { background: var(--bg); }
+/* `:hover` weighs more than `.tab--active`, so an unscoped hover rule repainted
+   the active tab light grey while its text stayed white — the label vanished.
+   The active tab keeps its own colours and only brightens. */
+.tab:hover:not(.tab--active) { background: var(--bg); color: var(--ink); }
 
 .tab--active { background: var(--accent); color: var(--accent-ink); }
+.tab--active:hover { filter: brightness(1.1); }
 
 main { max-width: 1100px; margin: 0 auto; padding: 24px; }
 
@@ -76,12 +80,28 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
   cursor: pointer;
 }
 
-.button:hover:not(:disabled) { border-color: var(--muted); }
-.button:disabled { opacity: 0.5; cursor: not-allowed; }
+/* Scoped away from the primary button: an unscoped background here would repaint
+   the blue button grey on hover and leave its white label on light grey. */
+.button:hover:not(:disabled):not(.button--primary) {
+  background: var(--bg);
+  border-color: var(--muted);
+}
+
+/* No `opacity` trick. Half-transparent blue with white text reads as grey on
+   grey, and the label disappears exactly when the button explains why it is
+   unavailable. A disabled control gets its own honest colours instead. */
+.button:disabled {
+  cursor: not-allowed;
+  background: var(--bg);
+  border-color: var(--line);
+  color: var(--muted);
+  filter: none;
+}
 
 .button--primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
-.button--primary:hover:not(:disabled) { filter: brightness(1.08); }
+.button--primary:hover:not(:disabled) { filter: brightness(1.1); }
 .button--ghost { border: none; color: var(--muted); }
+.button--ghost:hover:not(:disabled) { color: var(--ink); }
 
 .badge {
   padding: 4px 10px;
@@ -95,6 +115,10 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
 .badge--waiting { background: var(--warning-bg); color: var(--warning); }
 .badge--done { background: #e8f5ec; color: var(--ok); }
 .badge--failed { background: var(--error-bg); color: var(--error); }
+/* Прогон против заглушки обязан быть заметен: иначе его не отличить от боевого. */
+.badge--demo { background: var(--warning-bg); color: var(--warning); }
+
+.check--demo { margin-top: 12px; font-size: 14px; color: var(--warning); }
 
 .facts { display: flex; gap: 40px; flex-wrap: wrap; margin: 0 0 16px; }
 .fact dt { font-size: 13px; color: var(--muted); }

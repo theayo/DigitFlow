@@ -22,7 +22,15 @@
         <div class="row row--start">
           <button id="start" class="button button--primary" type="button">Скачать данные</button>
           <span id="run-status" class="badge badge--idle">процесс не запускался</span>
+          <span id="run-demo" class="badge badge--demo" hidden>заглушка</span>
         </div>
+
+        <!-- Виден только при DEMO_MODE в окружении: сервер всё равно проверит
+             настройку сам, спрятанная галочка — удобство, а не защита. -->
+        <label id="demo-switch" class="check check--demo" hidden>
+          <input type="checkbox" id="demo-mode">
+          <span>Тестовый прогон: брать файлы из заглушки, а не из боевого API</span>
+        </label>
         <!-- Две разные беды, поэтому и два места: неудачный запуск сообщает
              о том, что пользователь только что сделал, а сбой опроса — о фоне,
              и он обязан исчезнуть сам, как только связь восстановится. -->

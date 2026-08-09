@@ -119,7 +119,19 @@ const downloadScreen = {
     // Ticks between polls so the countdown moves every second, not once a second
     // per network round trip.
     this.tickTimer = setInterval(() => this.renderWaiting(), 1000);
+    this.loadConfig();
     this.poll();
+  },
+
+  async loadConfig() {
+    // The switch is drawn only where the deployment allows it. Failing to ask is
+    // not worth a message: the page works, it simply offers no demo run.
+    try {
+      const config = await request("/api/config");
+      $("demo-switch").hidden = !config.demo_mode;
+    } catch {
+      $("demo-switch").hidden = true;
+    }
   },
 
   async start() {
@@ -131,7 +143,7 @@ const downloadScreen = {
     // reason the button refused would vanish a second later on its own.
     showError($("start-error"), "");
     try {
-      this.run = await postJson("/api/runs", null);
+      this.run = await postJson("/api/runs", { demo: $("demo-mode").checked });
       this.render();
     } catch (error) {
       showError($("start-error"), error.message);
@@ -174,6 +186,7 @@ const downloadScreen = {
     if (!run) {
       badge.textContent = "процесс не запускался";
       badge.className = "badge badge--idle";
+      $("run-demo").hidden = true;
       $("start").disabled = this.starting;
       $("run-card").hidden = true;
       $("log-card").hidden = true;
@@ -182,6 +195,8 @@ const downloadScreen = {
 
     badge.textContent = STATUS_LABELS[run.status] || run.status;
     badge.className = `badge ${STATUS_BADGES[run.status] || "badge--idle"}`;
+    // Says what the numbers below actually describe: real files or the stub's.
+    $("run-demo").hidden = !run.demo;
     // The button stays disabled for as long as a run occupies the slot; the
     // server would answer 409 anyway.
     $("start").disabled = run.active || this.starting;

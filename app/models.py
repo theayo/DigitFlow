@@ -5,6 +5,7 @@ from datetime import datetime
 from sqlalchemy import (
     CHAR,
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
     text,
 )
@@ -71,6 +73,12 @@ class DownloadRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     names_seen: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     files_saved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Which catalog this run talked to. Stored rather than inferred: a run against
+    # the stub must be impossible to mistake for a real one afterwards — in the
+    # log, in the list of runs, or in a screenshot.
+    demo: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     # Diagnostics for status='failed': what happened, to which file, after how many attempts.
     error: Mapped[str | None] = mapped_column(Text)
 

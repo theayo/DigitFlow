@@ -154,11 +154,12 @@ async def _run_with_lock(
             )
             await limiter.reset()
 
+            # Which catalog this run talks to was decided when it was created and
+            # is stored on the row, so a redelivered task cannot change its mind
+            # halfway and finish a demo run against the real service.
+            base_url = await _catalog_url(run_id, settings)
             http = await stack.enter_async_context(
-                httpx.AsyncClient(
-                    base_url=settings.external_api_base_url,
-                    timeout=settings.external_timeout_s,
-                )
+                httpx.AsyncClient(base_url=base_url, timeout=settings.external_timeout_s)
             )
             runner = DownloadRunner(
                 run_id=run_id,
@@ -187,6 +188,26 @@ async def _run_with_lock(
     with contextlib.suppress(RedisError):
         await limiter.reset()
     return status
+
+
+async def _catalog_url(run_id: int, settings) -> str:
+    """Pick the catalog this run was created for: the real service or the stub."""
+    async with get_sessionmaker()() as session:
+        run = await session.get(DownloadRun, run_id)
+        if run is None or not run.demo:
+            return settings.external_api_base_url
+
+        session.add(
+            RunEvent(
+                run_id=run_id,
+                level="warning",
+                message=f"источник данных — заглушка {settings.demo_api_base_url}, "
+                "боевое API не используется",
+                ts=utc_now(),
+            )
+        )
+        await session.commit()
+        return settings.demo_api_base_url
 
 
 async def _start_working(run_id: int) -> bool:

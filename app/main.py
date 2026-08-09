@@ -6,13 +6,26 @@ from fastapi import FastAPI, Response, status
 from sqlalchemy import text
 
 from app.api import files, runs, stats
+from app.config import get_settings
 from app.db import get_engine, get_redis
+from app.schemas import ServiceConfig
 
 app = FastAPI(title="DigitFlow")
 
 app.include_router(runs.router)
 app.include_router(files.router)
 app.include_router(stats.router)
+
+
+@app.get("/api/config", response_model=ServiceConfig)
+async def config() -> ServiceConfig:
+    """What this deployment allows the UI to offer.
+
+    The demo switch is drawn only where it is permitted; the server checks the
+    same setting again when a run is started, so hiding the control is a
+    convenience and not the guard.
+    """
+    return ServiceConfig(demo_mode=get_settings().demo_mode)
 
 
 @app.get("/api/health")

@@ -28,6 +28,16 @@ class Settings(BaseSettings):
     candidate_id: str
     external_timeout_s: float = Field(default=30.0, gt=0)
 
+    # --- demo mode ---
+    # Off unless a deployment says otherwise. With it on, the download page grows
+    # a switch that runs against `demo_api_base_url` — the stub from
+    # `tools/fake_external_api.py` — instead of the real service. The real
+    # identifier is single-use (§ 2), so without this the process can be shown
+    # exactly once. The API refuses a demo run when this is off, so the switch
+    # cannot be forced from outside.
+    demo_mode: bool = False
+    demo_api_base_url: str = "http://api:9000"
+
     # --- request interval ---
     external_min_interval_ms: int = Field(default=1000, gt=0)
     external_min_interval_max_ms: int = Field(default=15000, gt=0)

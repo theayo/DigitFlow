@@ -32,6 +32,18 @@ class EventOut(BaseModel):
     message: str
 
 
+class ServiceConfig(BaseModel):
+    """What the UI needs to know about this deployment before drawing anything."""
+
+    demo_mode: bool
+
+
+class StartRunRequest(BaseModel):
+    """Body of `POST /api/runs`. Absent body means an ordinary run."""
+
+    demo: bool = False
+
+
 class RunOut(BaseModel):
     """State of a run as the download page needs it.
 
@@ -42,6 +54,8 @@ class RunOut(BaseModel):
     run_id: int
     status: str
     active: bool
+    # True when the run went to the stub catalog instead of the real service.
+    demo: bool = False
     started_at_nsk: datetime
     finished_at_nsk: datetime | None = None
     names_seen: int

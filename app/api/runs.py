@@ -18,7 +18,7 @@ from app.db import get_session
 from app.dependencies import get_progress_store, get_run_slot, get_task_publisher
 from app.models import ACTIVE_RUN_INDEX, DownloadRun, RunEvent
 from app.progress import Progress, ProgressStore
-from app.schemas import EventOut, RunOut
+from app.schemas import EventOut, RunOut, StartRunRequest
 from app.services.runs import (
     RunSlot,
     SlotUnavailable,
@@ -40,9 +40,24 @@ SlotDep = Annotated[RunSlot, Depends(get_run_slot)]
 
 
 @router.post("", response_model=RunOut, status_code=status.HTTP_201_CREATED)
-async def start_run(session: SessionDep, slot: SlotDep, publisher: PublisherDep) -> RunOut:
+async def start_run(
+    session: SessionDep,
+    slot: SlotDep,
+    publisher: PublisherDep,
+    options: StartRunRequest | None = None,
+) -> RunOut:
     """Queue a download run, or refuse with 409 while one is already active."""
     settings = get_settings()
+    demo = bool(options and options.demo)
+
+    # Checked on the server, not only hidden in the UI: a deployment that did not
+    # ask for demo mode must not be talked into the stub catalog by a handmade
+    # request.
+    if demo and not settings.demo_mode:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="демонстрационный режим выключен: включите DEMO_MODE в окружении",
+        )
 
     try:
         # A worker that died left its run marked active, and that row would block
@@ -71,6 +86,7 @@ async def start_run(session: SessionDep, slot: SlotDep, publisher: PublisherDep)
         candidate_id=settings.candidate_id,
         status="pending",
         started_at=utc_now(),
+        demo=demo,
     )
     try:
         session.add(run)
@@ -84,6 +100,17 @@ async def start_run(session: SessionDep, slot: SlotDep, publisher: PublisherDep)
                 run_id=run.id, level="info", message="задача поставлена в очередь", ts=utc_now()
             )
         )
+        if demo:
+            # Said out loud in the run's own log, so a stub run cannot later be
+            # read — or screenshotted — as a real download.
+            session.add(
+                RunEvent(
+                    run_id=run.id,
+                    level="warning",
+                    message="демонстрационный режим: ран пойдёт в заглушку, а не в боевое API",
+                    ts=utc_now(),
+                )
+            )
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
@@ -228,6 +255,7 @@ def _serialize(
         run_id=run.id,
         status=run.status,
         active=is_active(run.status),
+        demo=run.demo,
         started_at_nsk=to_display(run.started_at),
         finished_at_nsk=to_display(run.finished_at) if run.finished_at else None,
         names_seen=names_seen,
