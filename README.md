@@ -27,9 +27,6 @@
 |:---:|:---:|
 | ![Список файлов, сортировка и выбор](screenshots/files-list.jpg) | ![Суммарная и постраничная статистика цифр](screenshots/statistics.jpg) |
 
-Подробные требования, архитектурные решения и инварианты находятся в
-[`docs/PROJECT.md`](docs/PROJECT.md).
-
 ## Стек
 
 Python 3.12, FastAPI, SQLAlchemy 2, PostgreSQL, Redis, RabbitMQ, Celery,
@@ -222,5 +219,4 @@ nginx/           reverse proxy и раздача SPA
 static/          интерфейс без сборки и Node.js
 tests/           unit- и integration-тесты
 tools/           локальная заглушка внешнего API
-docs/            требования и первоисточники задания
 ```
