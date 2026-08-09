@@ -36,7 +36,9 @@ services:
   api:
     build: .
     env_file: .env
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: >-
+      sh -c "alembic upgrade head &&
+      exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     # Direct access bypassing nginx — for manual checks and Swagger UI on /docs.
     ports:
       - "8000:8000"
@@ -72,6 +74,10 @@ services:
     volumes:
       - .:/srv
     depends_on:
+      # The API becomes healthy only after Alembic has reached head, so the
+      # worker cannot consume a persisted message against an unmigrated schema.
+      api:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
