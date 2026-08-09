@@ -4,9 +4,175 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Сервис выкачки и анализа файлов</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <h1>Каркас поднят</h1>
-  <p>Интерфейс появится на четвёртом слое. Проверка связности: <a href="/api/health">/api/health</a>.</p>
+  <header class="top">
+    <h1>Каталог файлов</h1>
+    <nav class="tabs">
+      <a class="tab" href="#/download" data-screen="download">Скачивание</a>
+      <a class="tab" href="#/files" data-screen="files">Файлы и расчёты</a>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ── Экран 1: скачивание ─────────────────────────────────────────── -->
+    <section id="screen-download" class="screen">
+      <div class="panel">
+        <div class="row row--start">
+          <button id="start" class="button button--primary" type="button">Скачать данные</button>
+          <span id="run-status" class="badge badge--idle">процесс не запускался</span>
+        </div>
+        <!-- Две разные беды, поэтому и два места: неудачный запуск сообщает
+             о том, что пользователь только что сделал, а сбой опроса — о фоне,
+             и он обязан исчезнуть сам, как только связь восстановится. -->
+        <p id="start-error" class="error" hidden></p>
+        <p id="poll-error" class="error error--poll" hidden></p>
+      </div>
+
+      <div id="run-card" class="panel" hidden>
+        <dl class="facts">
+          <div class="fact">
+            <dt>Старт процесса (Новосибирск)</dt>
+            <dd id="started-at">—</dd>
+          </div>
+          <div class="fact">
+            <dt>Завершён</dt>
+            <dd id="finished-at">—</dd>
+          </div>
+          <div class="fact">
+            <dt>Прогресс</dt>
+            <dd id="progress-text">—</dd>
+          </div>
+        </dl>
+
+        <div class="progress"><div id="progress-bar" class="progress__bar"></div></div>
+
+        <!-- Пауза показывается отдельно: получасовое ожидание не должно
+             выглядеть как зависший процесс. -->
+        <div id="waiting" class="waiting" hidden>
+          <div class="waiting__timer">
+            <span class="waiting__label">Пауза, следующая попытка через</span>
+            <span id="countdown" class="waiting__countdown">—</span>
+          </div>
+          <p id="retry-reason" class="waiting__reason"></p>
+        </div>
+
+        <p id="run-error" class="error" hidden></p>
+      </div>
+
+      <div id="log-card" class="panel" hidden>
+        <h2>Лог событий</h2>
+        <ul id="log" class="log"></ul>
+      </div>
+    </section>
+
+    <!-- ── Экран 2: файлы и расчёты ────────────────────────────────────── -->
+    <section id="screen-files" class="screen">
+      <div class="panel">
+        <div class="row row--between">
+          <div class="row">
+            <label class="field">
+              <span>На странице</span>
+              <select id="files-size">
+                <option value="10">10</option>
+                <option value="20" selected>20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Сортировка по времени</span>
+              <select id="files-order">
+                <option value="desc" selected>сначала новые</option>
+                <option value="asc">сначала старые</option>
+              </select>
+            </label>
+          </div>
+          <span id="files-total" class="muted">—</span>
+        </div>
+
+        <div class="row row--between selection">
+          <div class="row">
+            <label class="check">
+              <input type="checkbox" id="select-page">
+              <span>Все на странице</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="select-all">
+              <span>Вообще все файлы в базе</span>
+            </label>
+            <button id="clear-selection" class="button button--ghost" type="button">Сбросить</button>
+          </div>
+          <div class="row">
+            <span id="selection-info" class="muted">ничего не выбрано</span>
+            <button id="calculate" class="button button--primary" type="button" disabled>
+              Произвести расчёты
+            </button>
+          </div>
+        </div>
+        <p id="selection-warning" class="error" hidden></p>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th class="cell--check"></th>
+              <th>Имя файла</th>
+              <th>Время скачивания (Новосибирск)</th>
+            </tr>
+          </thead>
+          <tbody id="files-body">
+            <tr><td colspan="3" class="muted">Загрузка…</td></tr>
+          </tbody>
+        </table>
+
+        <div class="row row--between pager">
+          <button id="files-prev" class="button" type="button">← Назад</button>
+          <span id="files-page" class="muted">—</span>
+          <button id="files-next" class="button" type="button">Вперёд →</button>
+        </div>
+      </div>
+
+      <div id="stats-card" class="panel" hidden>
+        <div class="row row--between">
+          <h2>Статистика цифр</h2>
+          <span id="stats-scope" class="muted"></span>
+        </div>
+        <!-- Результат не пропадает при смене галочек — он просто перестаёт
+             описывать текущий выбор, и об этом надо сказать вслух. -->
+        <p id="stats-stale" class="stale" hidden>
+          Выбор изменён — результат ниже посчитан для прежней выборки.
+          Нажмите «Произвести расчёты», чтобы пересчитать.
+        </p>
+        <p id="stats-error" class="error" hidden></p>
+
+        <h3>Суммарно по выбранным файлам</h3>
+        <!-- Одиннадцать колонок не помещаются в узкий экран: пусть таблица
+             прокручивается внутри себя, а не растягивает страницу. -->
+        <div class="scroll-x">
+          <table class="table table--digits">
+            <thead><tr id="total-head"></tr></thead>
+            <tbody><tr id="total-body"></tr></tbody>
+          </table>
+        </div>
+
+        <h3>По каждому файлу</h3>
+        <div class="scroll-x">
+          <table class="table table--digits">
+            <thead><tr id="per-file-head"></tr></thead>
+            <tbody id="per-file-body"></tbody>
+          </table>
+        </div>
+
+        <div class="row row--between pager">
+          <button id="stats-prev" class="button" type="button">← Назад</button>
+          <span id="stats-page" class="muted">—</span>
+          <button id="stats-next" class="button" type="button">Вперёд →</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
 </body>
 </html>
