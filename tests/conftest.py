@@ -8,7 +8,7 @@ still matches its working counterpart.
 
 import asyncio
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 
 import asyncpg
 import pytest
@@ -58,9 +58,14 @@ get_settings.cache_clear()
 
 # Imported only after the redirect: these modules resolve settings lazily, but the
 # import order should not be something a reader has to verify.
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+
 from app.db import get_engine, get_sessionmaker  # noqa: E402
+from app.dependencies import get_task_publisher  # noqa: E402
+from app.main import app  # noqa: E402
+from app.progress import PROGRESS_KEY  # noqa: E402
+from app.worker.celery_app import celery_app  # noqa: E402
 from app.worker.lock import LOCK_KEY  # noqa: E402
-from app.worker.progress import PROGRESS_KEY  # noqa: E402
 from app.worker.ratelimit import INTERVAL_KEY, NEXT_ALLOWED_KEY  # noqa: E402
 
 WORKER_KEYS = (PROGRESS_KEY, LOCK_KEY, NEXT_ALLOWED_KEY, INTERVAL_KEY)
@@ -119,6 +124,27 @@ async def _truncate() -> None:
 
 
 @pytest.fixture
+async def clean_db() -> AsyncIterator[None]:
+    """Empty tables for the duration of one test.
+
+    Requested by tests that read "the latest run" or count files, where rows left
+    behind by an earlier test would change the answer.
+    """
+    await _truncate()
+    try:
+        yield
+    finally:
+        await _truncate()
+
+
+@pytest.fixture
+async def api() -> AsyncIterator[AsyncClient]:
+    """HTTP client speaking to the application in-process."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        yield client
+
+
+@pytest.fixture
 async def redis() -> AsyncIterator[aioredis.Redis]:
     """Redis client on the dedicated test database, cleared around each test."""
     client = aioredis.from_url(TEST_REDIS_URL)
@@ -128,6 +154,43 @@ async def redis() -> AsyncIterator[aioredis.Redis]:
     finally:
         await client.delete(*WORKER_KEYS)
         await client.aclose()
+
+
+class RecordingPublisher:
+    """A task publisher that remembers instead of publishing."""
+
+    def __init__(self) -> None:
+        self.published: list[int] = []
+
+    async def __call__(self, run_id: int) -> None:
+        self.published.append(run_id)
+
+
+@pytest.fixture(autouse=True)
+def published_tasks(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
+    """Replace the task publisher for every test. Autouse, and deliberately not opt-in.
+
+    A real publish would be picked up by the worker container running alongside
+    the suite, and that worker downloads from the live external API. The rule
+    "tests never touch the external API" is enforced here rather than trusted to
+    every test that starts a run.
+
+    Two layers, because the port alone only covers what goes through `Depends`:
+    the API gets a recording publisher, and the broker call underneath is made to
+    fail loudly, so any path that bypasses the port fails the test instead of
+    reaching RabbitMQ.
+    """
+    publisher = RecordingPublisher()
+    app.dependency_overrides[get_task_publisher] = lambda: publisher
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("тест попытался опубликовать задачу в настоящий брокер")
+
+    monkeypatch.setattr(celery_app, "send_task", forbidden)
+    try:
+        yield publisher.published
+    finally:
+        app.dependency_overrides.pop(get_task_publisher, None)
 
 
 @pytest.fixture

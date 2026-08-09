@@ -2,14 +2,17 @@
 
 from typing import Any
 
-import redis.asyncio as aioredis
 from fastapi import FastAPI, Response, status
 from sqlalchemy import text
 
-from app.config import get_settings
-from app.db import get_engine
+from app.api import files, runs, stats
+from app.db import get_engine, get_redis
 
 app = FastAPI(title="DigitFlow")
+
+app.include_router(runs.router)
+app.include_router(files.router)
+app.include_router(stats.router)
 
 
 @app.get("/api/health")
@@ -19,7 +22,6 @@ async def health(response: Response) -> dict[str, Any]:
     Returns 503 when any dependency is unreachable: the container healthcheck
     consumes this endpoint and can only tell states apart by status code.
     """
-    settings = get_settings()
     checks: dict[str, str] = {}
 
     try:
@@ -29,14 +31,11 @@ async def health(response: Response) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — report the state, do not fail the endpoint
         checks["postgres"] = f"error: {exc}"
 
-    redis = aioredis.from_url(settings.redis_url)
     try:
-        await redis.ping()
+        await get_redis().ping()
         checks["redis"] = "ok"
     except Exception as exc:  # noqa: BLE001
         checks["redis"] = f"error: {exc}"
-    finally:
-        await redis.aclose()
 
     healthy = set(checks.values()) == {"ok"}
     if not healthy:
