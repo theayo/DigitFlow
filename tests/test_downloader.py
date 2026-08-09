@@ -24,7 +24,7 @@ from app.services.runs import claim_run, start_running
 from app.time import utc_now
 from app.worker.archive import CONTENT_LENGTH, content_hash, digit_counts
 from app.worker.client import DOWNLOAD_PATH, DOWNLOADED_PATH, NAMES_PATH, FilesApiClient
-from app.worker.downloader import DownloadRunner
+from app.worker.downloader import DownloadRunner, _files_word
 from app.worker.errors import NetworkExhausted
 from app.worker.lock import LOCK_KEY, RedisRunLock, token_for
 
@@ -360,6 +360,119 @@ async def test_several_bad_names_are_all_reported(redis, sessionmaker) -> None:
 
     run = await fetch_run(sessionmaker, run_id)
     assert first_bad in run.error and second_bad in run.error
+
+
+# --- what the log says about confirmations ----------------------------------
+
+
+async def download_two_names(
+    redis, sessionmaker, run_id: int, names: list[str], confirmation: dict[str, int]
+) -> list[str]:
+    """One iteration with a fixed answer from /downloaded. Returns the log."""
+    async with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get(NAMES_PATH).mock(
+            side_effect=[
+                httpx.Response(200, json={"file_names": names}),
+                httpx.Response(200, json={"file_names": []}),
+            ]
+        )
+        mock.post(DOWNLOAD_PATH).mock(
+            side_effect=lambda request: httpx.Response(200, content=zip_for(_requested(request)))
+        )
+        mock.post(DOWNLOADED_PATH).respond(200, json=confirmation)
+
+        await run_loop(run_id, redis, sessionmaker)
+
+    return await events(sessionmaker, run_id)
+
+
+async def test_the_ordinary_confirmation_says_nothing_about_zeroes(redis, sessionmaker) -> None:
+    """`already_marked = 0` is the normal case: printing it on every chunk is noise."""
+    run_id = await make_run(sessionmaker)
+    names = [f"{uuid.uuid4()}.txt" for _ in range(2)]
+
+    log = await download_two_names(
+        redis, sessionmaker, run_id, names, {"marked_now": 2, "already_marked": 0}
+    )
+
+    assert "сохранено 2 файла и подтверждено на стороне API" in log
+    assert not any("уже было отмечено" in message for message in log)
+
+
+async def test_a_mixed_confirmation_keeps_both_numbers(redis, sessionmaker) -> None:
+    """Here the counters mean something, so they are spelled out."""
+    run_id = await make_run(sessionmaker)
+    names = [f"{uuid.uuid4()}.txt" for _ in range(2)]
+
+    log = await download_two_names(
+        redis, sessionmaker, run_id, names, {"marked_now": 1, "already_marked": 1}
+    )
+
+    assert (
+        "сохранено 2 файла и подтверждено на стороне API "
+        "(новых отметок 1, уже было отмечено 1)" in log
+    )
+
+
+async def test_a_fully_repeated_confirmation_is_reported_and_counts_as_no_progress(
+    redis, sessionmaker
+) -> None:
+    """Everything was already marked: the log says so, and the guard still fires.
+
+    `marked_now = 0` is exactly the shape of the loop the stale-iteration guard
+    exists to catch — /names keeps handing out names that never get confirmed.
+    """
+    run_id = await make_run(sessionmaker)
+    names = [f"{uuid.uuid4()}.txt" for _ in range(2)]
+
+    async with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get(NAMES_PATH).respond(200, json={"file_names": names})
+        mock.post(DOWNLOAD_PATH).mock(
+            side_effect=lambda request: httpx.Response(200, content=zip_for(_requested(request)))
+        )
+        mock.post(DOWNLOADED_PATH).respond(200, json={"marked_now": 0, "already_marked": 2})
+
+        status = await run_loop(run_id, redis, sessionmaker)
+
+    assert status == "failed"
+    log = await events(sessionmaker, run_id)
+    assert any("уже было отмечено 2" in message for message in log)
+    assert any("итерация без прогресса" in message for message in log)
+
+    run = await fetch_run(sessionmaker, run_id)
+    assert "без единого подтверждённого" in run.error
+
+
+@pytest.mark.parametrize(
+    ("count", "word"),
+    [
+        (1, "файл"),
+        (2, "файла"),
+        (4, "файла"),
+        (5, "файлов"),
+        (11, "файлов"),
+        (14, "файлов"),
+        (21, "файл"),
+        (22, "файла"),
+        (25, "файлов"),
+        (111, "файлов"),
+    ],
+)
+def test_the_word_file_is_declined(count: int, word: str) -> None:
+    """The log is read by a person: «2 файлов» is a typo, not a message."""
+    assert _files_word(count) == word
+
+
+async def test_the_confirmation_uses_the_declined_word(redis, sessionmaker) -> None:
+    """A chunk of one is the case the old wording got wrong most visibly."""
+    run_id = await make_run(sessionmaker)
+    name = f"{uuid.uuid4()}.txt"
+
+    log = await download_two_names(
+        redis, sessionmaker, run_id, [name], {"marked_now": 1, "already_marked": 0}
+    )
+
+    assert "сохранено 1 файл и подтверждено на стороне API" in log
 
 
 async def test_a_lost_lock_stops_the_chunk_immediately(redis, sessionmaker) -> None:

@@ -49,6 +49,18 @@ def chunked(items: Sequence[str], size: int) -> Iterator[list[str]]:
         yield list(items[start : start + size])
 
 
+def _files_word(count: int) -> str:
+    """Russian plural for "файл" — the log is read by a person, not by a parser."""
+    if 11 <= count % 100 <= 14:
+        return "файлов"
+    remainder = count % 10
+    if remainder == 1:
+        return "файл"
+    if 2 <= remainder <= 4:
+        return "файла"
+    return "файлов"
+
+
 class DownloadRunner:
     """Runs a single download run from start to terminal status."""
 
@@ -149,11 +161,14 @@ class DownloadRunner:
             "отметка скачанных",
         )
         self._files_saved += len(saved)
-        await self._event(
-            "info",
-            f"сохранено и отмечено {len(saved)} файлов "
-            f"(новых на той стороне {marked_now}, уже отмеченных {already})",
-        )
+        # The counters are only spelled out when they say something. In the
+        # ordinary case `already` is zero, and printing that zero on every chunk
+        # only buries the lines that matter. `marked_now` still drives the
+        # stale-iteration guard either way (§ 8.4).
+        message = f"сохранено {len(saved)} {_files_word(len(saved))} и подтверждено на стороне API"
+        if already:
+            message += f" (новых отметок {marked_now}, уже было отмечено {already})"
+        await self._event("info", message)
         await self._publish()
         # Only newly marked files count as progress: already_marked means the file
         # was confirmed before yet /names handed it out again, which is exactly the

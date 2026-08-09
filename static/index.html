@@ -54,7 +54,16 @@
           </div>
         </dl>
 
-        <div class="progress"><div id="progress-bar" class="progress__bar"></div></div>
+        <div
+          id="progress-track"
+          class="progress"
+          role="progressbar"
+          aria-label="Прогресс скачивания каталога"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-busy="false"
+        ><div id="progress-bar" class="progress__bar"></div></div>
+        <p class="progress-note">Общий размер каталога заранее неизвестен</p>
 
         <!-- Пауза показывается отдельно: получасовое ожидание не должно
              выглядеть как зависший процесс. -->

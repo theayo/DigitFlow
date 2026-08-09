@@ -113,6 +113,7 @@ const downloadScreen = {
   pollTimer: null,
   tickTimer: null,
   starting: false,
+  demoModeAllowed: false,
 
   init() {
     $("start").addEventListener("click", () => this.start());
@@ -128,9 +129,13 @@ const downloadScreen = {
     // not worth a message: the page works, it simply offers no demo run.
     try {
       const config = await request("/api/config");
-      $("demo-switch").hidden = !config.demo_mode;
+      this.demoModeAllowed = config.demo_mode === true;
+      $("demo-switch").hidden = !this.demoModeAllowed;
+      if (!this.demoModeAllowed) $("demo-mode").checked = false;
     } catch {
+      this.demoModeAllowed = false;
       $("demo-switch").hidden = true;
+      $("demo-mode").checked = false;
     }
   },
 
@@ -143,7 +148,9 @@ const downloadScreen = {
     // reason the button refused would vanish a second later on its own.
     showError($("start-error"), "");
     try {
-      this.run = await postJson("/api/runs", { demo: $("demo-mode").checked });
+      this.run = await postJson("/api/runs", {
+        demo: this.demoModeAllowed && $("demo-mode").checked,
+      });
       this.render();
     } catch (error) {
       showError($("start-error"), error.message);
@@ -214,11 +221,29 @@ const downloadScreen = {
     $("progress-text").textContent =
       `получено ${seen} ${plural(seen, "название", "названия", "названий")} файлов, ` +
       `скачано ${saved} из ${seen}`;
-    $("progress-bar").style.width = seen > 0 ? `${Math.min(100, (saved / seen) * 100)}%` : "0";
+    this.renderProgressBar(run.status);
 
     showError($("run-error"), run.status === "failed" && run.error ? run.error : "");
     this.renderWaiting();
     this.renderLog(run.events || []);
+  },
+
+  renderProgressBar(status) {
+    const track = $("progress-track");
+    const bar = $("progress-bar");
+    const active = ["pending", "starting", "running", "waiting_retry"].includes(status);
+
+    track.classList.toggle("progress--indeterminate", active);
+    track.classList.toggle("progress--failed", status === "failed");
+    track.setAttribute("aria-busy", String(active));
+
+    if (status === "done") {
+      bar.style.width = "100%";
+      track.setAttribute("aria-valuenow", "100");
+    } else {
+      bar.style.width = active ? "35%" : "0";
+      track.removeAttribute("aria-valuenow");
+    }
   },
 
   renderWaiting() {

@@ -15,6 +15,10 @@
 
 * { box-sizing: border-box; }
 
+/* Author styles such as `.check { display: flex }` must not override the
+   semantic HTML `hidden` attribute. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -136,6 +140,28 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
   width: 0;
   background: var(--accent);
   transition: width 0.3s ease;
+}
+
+.progress--indeterminate .progress__bar {
+  animation: progress-indeterminate 1.4s ease-in-out infinite;
+  transition: none;
+}
+
+.progress--failed .progress__bar { background: var(--error); }
+
+.progress-note {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@keyframes progress-indeterminate {
+  from { transform: translateX(-120%); }
+  to { transform: translateX(300%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress--indeterminate .progress__bar { animation-duration: 3s; }
 }
 
 .waiting {
