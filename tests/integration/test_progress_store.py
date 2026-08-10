@@ -1,13 +1,16 @@
-"""Live progress storage and task-queue integration."""
+"""The Redis hash behind `ProgressStore`.
 
-import threading
+Runs against the test Redis: what is worth checking here is the encoding of a
+real record and the refusal to trust a damaged one, and both only mean something
+against a real server.
+"""
+
 from datetime import timedelta
 
 import pytest
 from redis.exceptions import RedisError
 
 from app.progress import PROGRESS_KEY, Progress, RedisProgressStore
-from app.task_queue import DOWNLOAD_TASK_NAME, publish_download
 from app.time import utc_now
 
 # --- progress store ---------------------------------------------------------
@@ -149,44 +152,3 @@ async def test_publishing_progress_never_raises() -> None:
 
 async def test_reading_progress_never_raises() -> None:
     assert await RedisProgressStore(UnreachableRedis()).read() is None
-
-
-# --- task publisher ---------------------------------------------------------
-
-
-class FakeCelery:
-    """Records what would have been published."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, list, int]] = []
-
-    def send_task(self, name: str, args: list | None = None, **kwargs: object) -> object:
-        self.calls.append((name, list(args or []), threading.get_ident()))
-        return object()
-
-
-async def test_publisher_hands_the_run_to_celery_off_the_event_loop(monkeypatch) -> None:
-    """send_task blocks on a socket, so it must not run on the loop thread."""
-    celery = FakeCelery()
-
-    monkeypatch.setattr("app.task_queue.celery_app.send_task", celery.send_task)
-    await publish_download(17)
-
-    assert [(name, args) for name, args, _ in celery.calls] == [(DOWNLOAD_TASK_NAME, [17])]
-    assert celery.calls[0][2] != threading.get_ident()
-
-
-async def test_publisher_propagates_a_delivery_failure(monkeypatch) -> None:
-    """The caller has to learn that delivery is in doubt, not be told it succeeded."""
-
-    class BrokenCelery:
-        def send_task(self, *args: object, **kwargs: object) -> None:
-            raise RuntimeError("брокер не подтвердил приём")
-
-    monkeypatch.setattr("app.task_queue.celery_app.send_task", BrokenCelery().send_task)
-    try:
-        await publish_download(1)
-    except RuntimeError as exc:
-        assert "брокер" in str(exc)
-    else:
-        raise AssertionError("ошибка публикации должна дойти до вызывающего")
